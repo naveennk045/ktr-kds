@@ -4,6 +4,8 @@ export type OrderItemStatus =
   | "READY"
   | "COLLECTED";
 
+export type OrderType = "DINEIN" | "TAKEAWAY";
+
 export interface KioskStoreRow {
   store_id: number;
   store_code: string;
@@ -25,6 +27,7 @@ export interface KdsOrder {
   store_id: number;
   order_id: string;
   kot_code: string;
+  order_type?: string;
   kot_number?: number;
   kot_date?: string;
   created_at: string;
@@ -52,7 +55,7 @@ export type WsEventType =
   | "ITEM_STATUS_CHANGED";
 
 export interface WsEnvelope<T = unknown> {
-  type: WsEventType | string;
+  type: string;
   payload: T;
 }
 

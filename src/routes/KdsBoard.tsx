@@ -203,16 +203,23 @@ export default function KdsBoard() {
       {visibleBoard?.orders.length === 0 && (
         <p style={{ color: "var(--muted)" }}>No tickets on the board.</p>
       )}
-      <div style={ticketGrid}>
-        {visibleBoard?.orders.map((order) => (
-          <article key={order.id} style={ticket}>
+      <div className="kds-ticket-grid" style={ticketGrid}>
+        {visibleBoard?.orders.map((order) => {
+          let orderTypeText = order.order_type;
+          if (order.order_type === "DINEIN") orderTypeText = "Dine-in";
+          if (order.order_type === "TAKEAWAY") orderTypeText = "Takeaway";
+          return (
+            <article key={order.id} style={ticket}>
             <div style={ticketHead}>
-              <span style={kot}>{order.kot_code}</span>
-              <span style={{ color: "var(--muted)", fontSize: "0.85rem" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minWidth: 0 }}>
+                <span style={kot}>{order.kot_code}</span>
+                {orderTypeText ? <span style={orderTypeBadge}>{orderTypeText}</span> : null}
+              </div>
+              <span style={{ color: "var(--muted)", fontSize: "0.85rem", textAlign: "right" }}>
                 {new Date(order.created_at).toLocaleString()}
               </span>
             </div>
-            <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+              <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
               {order.lines.map((line) => {
                 const next = nextOrderItemStatus(line.order_status);
                 let visualStatus: "PREPARING" | "READY" | "COLLECTED" = "PREPARING";
@@ -247,8 +254,9 @@ export default function KdsBoard() {
                 );
               })}
             </ul>
-          </article>
-        ))}
+            </article>
+          );
+        })}
       </div>
     </div>
   );
@@ -281,10 +289,10 @@ const clubbedStrip: CSSProperties = {
 };
 const clubbedChipWrap: CSSProperties = {
   display: "flex",
+  flexWrap: "wrap",
   gap: "0.55rem",
   marginTop: "0.65rem",
-  overflowX: "auto",
-  paddingBottom: "0.2rem",
+  overflowX: "visible",
 };
 const clubbedChip: CSSProperties = {
   display: "inline-flex",
@@ -313,8 +321,6 @@ const clubbedName: CSSProperties = {
   fontWeight: 600,
 };
 const ticketGrid: CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
   gap: "1rem",
 };
 const ticket: CSSProperties = {
@@ -332,6 +338,17 @@ const ticketHead: CSSProperties = {
   gap: "0.5rem",
 };
 const kot: CSSProperties = { fontSize: "1.25rem", fontWeight: 700, color: "var(--gold-accent)" };
+const orderTypeBadge: CSSProperties = {
+  fontSize: "0.72rem",
+  fontWeight: 700,
+  textTransform: "uppercase",
+  letterSpacing: "0.02em",
+  borderRadius: 999,
+  padding: "0.15rem 0.5rem",
+  background: "var(--order-type-gradient)",
+  color: "var(--text-on-dark)",
+  whiteSpace: "nowrap",
+};
 const lineBase: CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
