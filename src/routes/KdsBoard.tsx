@@ -178,89 +178,77 @@ export default function KdsBoard() {
         </div>
       )}
 
-      <div className="kds-layout" style={layout}>
-        <main style={mainCol}>
-          {!visibleBoard && !loadError && <p style={{ color: "var(--muted)" }}>Loading board…</p>}
-          {visibleBoard?.orders.length === 0 && (
-            <p style={{ color: "var(--muted)" }}>No tickets on the board.</p>
-          )}
-          <div style={ticketGrid}>
-            {visibleBoard?.orders.map((order) => (
-              <article key={order.id} style={ticket}>
-                <div style={ticketHead}>
-                  <span style={kot}>{order.kot_code}</span>
-                  <span style={{ color: "var(--muted)", fontSize: "0.85rem" }}>
-                    {new Date(order.created_at).toLocaleString()}
-                  </span>
-                </div>
-                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                  {order.lines.map((line) => {
-                    const next = nextOrderItemStatus(line.order_status);
-                    let visualStatus: "PREPARING" | "READY" | "COLLECTED" = "PREPARING";
-                    if (line.order_status === "READY") {
-                      visualStatus = "READY";
-                    } else if (line.order_status === "COLLECTED") {
-                      visualStatus = "COLLECTED";
-                    }
-                    return (
-                      <li key={line.id} style={lineRow(visualStatus)}>
-                        <div>
-                          <div style={{ fontWeight: 600 }}>{line.item_name}</div>
-                          <div style={{ fontSize: "0.85rem", color: "var(--muted)" }}>
-                            ×{line.quantity} · {statusLabel(line.order_status)}
-                          </div>
-                        </div>
-                        {next ? (
-                          <button
-                            type="button"
-                            style={advanceBtn}
-                            disabled={lineBusy === line.id}
-                            onClick={() => void advanceLine(line)}
-                          >
-                            {next === "READY" ? "Mark Ready" : "Mark Collected"}
-                          </button>
-                        ) : (
-                          <span style={{ color: "var(--ready)", fontSize: "0.85rem" }}>
-                            {statusLabel(line.order_status)}
-                          </span>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              </article>
+      <section style={clubbedStrip}>
+        <h2 style={{ margin: 0, fontSize: "1rem", color: "var(--text-secondary)" }}>Clubbed Summary</h2>
+        {!visibleBoard || visibleBoard.clubbed_totals.length === 0 ? (
+          <p style={{ color: "var(--muted)", margin: "0.5rem 0 0" }}>No open items.</p>
+        ) : (
+          <div style={clubbedChipWrap}>
+            {visibleBoard.clubbed_totals.map((row) => (
+              <div key={row.item_name} style={clubbedChip}>
+                <span style={clubbedQty}>{row.quantity}</span>
+                <span style={clubbedName}>{row.item_name}</span>
+              </div>
             ))}
           </div>
-        </main>
+        )}
+        {visibleBoard && (
+          <p style={{ marginTop: "0.6rem", fontSize: "0.8rem", color: "var(--muted)" }}>
+            Window {visibleBoard.live_window_minutes}m · max {visibleBoard.max_rows} tickets
+          </p>
+        )}
+      </section>
 
-        <aside className="kds-aside" style={aside}>
-          <h2 style={{ margin: "0 0 0.75rem", fontSize: "1rem" }}>Clubbed totals</h2>
-          {!visibleBoard || visibleBoard.clubbed_totals.length === 0 ? (
-            <p style={{ color: "var(--muted)", margin: 0 }}>No open items.</p>
-          ) : (
+      {!visibleBoard && !loadError && <p style={{ color: "var(--muted)" }}>Loading board…</p>}
+      {visibleBoard?.orders.length === 0 && (
+        <p style={{ color: "var(--muted)" }}>No tickets on the board.</p>
+      )}
+      <div style={ticketGrid}>
+        {visibleBoard?.orders.map((order) => (
+          <article key={order.id} style={ticket}>
+            <div style={ticketHead}>
+              <span style={kot}>{order.kot_code}</span>
+              <span style={{ color: "var(--muted)", fontSize: "0.85rem" }}>
+                {new Date(order.created_at).toLocaleString()}
+              </span>
+            </div>
             <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {visibleBoard.clubbed_totals.map((row) => (
-                <li
-                  key={row.item_name}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    padding: "0.35rem 0",
-                    borderBottom: "1px solid var(--border)",
-                  }}
-                >
-                  <span>{row.item_name}</span>
-                  <strong>{row.quantity}</strong>
-                </li>
-              ))}
+              {order.lines.map((line) => {
+                const next = nextOrderItemStatus(line.order_status);
+                let visualStatus: "PREPARING" | "READY" | "COLLECTED" = "PREPARING";
+                if (line.order_status === "READY") {
+                  visualStatus = "READY";
+                } else if (line.order_status === "COLLECTED") {
+                  visualStatus = "COLLECTED";
+                }
+                return (
+                  <li key={line.id} style={lineRow(visualStatus)}>
+                    <div>
+                      <div style={{ ...lineItemText, fontWeight: 600 }}>{line.item_name}</div>
+                      <div style={{ fontSize: "0.85rem", color: "var(--muted)" }}>
+                        ×{line.quantity} · {statusLabel(line.order_status)}
+                      </div>
+                    </div>
+                    {next ? (
+                      <button
+                        type="button"
+                        style={advanceBtn}
+                        disabled={lineBusy === line.id}
+                        onClick={() => void advanceLine(line)}
+                      >
+                        {next === "READY" ? "Mark Ready" : "Mark Collected"}
+                      </button>
+                    ) : (
+                      <span style={{ color: "var(--ready)", fontSize: "0.85rem" }}>
+                        {statusLabel(line.order_status)}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
-          )}
-          {visibleBoard && (
-            <p style={{ marginTop: "1rem", fontSize: "0.8rem", color: "var(--muted)" }}>
-              Window {visibleBoard.live_window_minutes}m · max {visibleBoard.max_rows} tickets
-            </p>
-          )}
-        </aside>
+          </article>
+        ))}
       </div>
     </div>
   );
@@ -283,24 +271,50 @@ const errBox: CSSProperties = {
   borderRadius: 8,
   marginBottom: "1rem",
 };
-const layout: CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "1fr minmax(220px, 280px)",
-  gap: "1.25rem",
-  alignItems: "start",
-};
-const mainCol: CSSProperties = { minWidth: 0 };
-const aside: CSSProperties = {
+const clubbedStrip: CSSProperties = {
   background: "var(--neutral-50)",
   border: "1px solid var(--border-primary)",
   borderRadius: 12,
   padding: "1rem",
-  position: "sticky",
-  top: "1rem",
+  marginBottom: "1rem",
+  boxShadow: "var(--shadow-sm)",
+};
+const clubbedChipWrap: CSSProperties = {
+  display: "flex",
+  gap: "0.55rem",
+  marginTop: "0.65rem",
+  overflowX: "auto",
+  paddingBottom: "0.2rem",
+};
+const clubbedChip: CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: "0.45rem",
+  border: "1px solid var(--border-primary)",
+  borderRadius: 999,
+  padding: "0.35rem 0.7rem",
+  background: "var(--bg-warm)",
+  whiteSpace: "nowrap",
+};
+const clubbedQty: CSSProperties = {
+  minWidth: 24,
+  height: 24,
+  borderRadius: 999,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  background: "var(--secondary-gradient)",
+  color: "var(--text-on-dark)",
+  fontWeight: 700,
+  fontSize: "0.78rem",
+};
+const clubbedName: CSSProperties = {
+  color: "var(--text-primary)",
+  fontWeight: 600,
 };
 const ticketGrid: CSSProperties = {
   display: "grid",
-  gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
+  gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
   gap: "1rem",
 };
 const ticket: CSSProperties = {
@@ -308,6 +322,7 @@ const ticket: CSSProperties = {
   border: "1px solid var(--border-primary)",
   borderRadius: 12,
   padding: "0.85rem 1rem",
+  minWidth: 0,
 };
 const ticketHead: CSSProperties = {
   display: "flex",
@@ -324,6 +339,11 @@ const lineBase: CSSProperties = {
   gap: "0.75rem",
   padding: "0.5rem 0",
   borderTop: "1px solid var(--neutral-300)",
+};
+
+const lineItemText: CSSProperties = {
+  wordBreak: "break-word",
+  overflowWrap: "anywhere",
 };
 function lineRow(status: "PREPARING" | "READY" | "COLLECTED"): CSSProperties {
   if (status === "COLLECTED") {
