@@ -1,4 +1,4 @@
-import type { KdsBoardPayload, KioskStoreRow, OrderItemStatus } from "./types";
+import type { KdsBoardPayload, KioskStoreRow, OrderItemStatus, TmsSnapshotPayload } from "./types";
 import { getApiBaseUrl } from "./storeContext";
 
 function buildUrl(path: string, query?: Record<string, string | number | undefined>): string {
@@ -40,16 +40,33 @@ export async function patchKdsLineStatus(
   xStoreId: string,
   lineId: number,
   status: OrderItemStatus,
+  quantity?: number,
 ): Promise<unknown> {
+  const body: { status: OrderItemStatus; quantity?: number } = { status };
+  if (quantity !== undefined && Number.isFinite(quantity) && quantity > 0) {
+    body.quantity = Math.floor(quantity);
+  }
   const res = await fetch(buildUrl(`/kds/items/${lineId}/status`), {
     method: "PATCH",
     headers: {
       "X-Store-Id": xStoreId,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ status }),
+    body: JSON.stringify(body),
   });
   return parseJson(res);
+}
+
+export async function fetchTmsSnapshot(xStoreId: string): Promise<TmsSnapshotPayload> {
+  const res = await fetch(buildUrl("/tms/snapshot"), {
+    headers: { "X-Store-Id": xStoreId },
+  });
+  return parseJson<TmsSnapshotPayload>(res);
+}
+
+/** URL for `EventSource` (browsers cannot set `X-Store-Id` on SSE). */
+export function tmsEventSourceUrl(storeId: number): string {
+  return buildUrl("/tms/stream", { store_id: storeId });
 }
 
 export function kdsWebSocketUrl(storeId: number, maxRows = 20): string {

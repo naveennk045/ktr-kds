@@ -12,6 +12,7 @@ export function nextOrderItemStatus(
 }
 
 export function statusLabel(s: OrderItemStatus): string {
+  if (s === "NOT_ACCEPTED") return "New";
   if (s === "READY") return "Ready";
   if (s === "COLLECTED") return "Collected";
   return "Preparing";

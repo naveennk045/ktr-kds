@@ -107,9 +107,12 @@ export default function Setup() {
             Header value: <code>X-Store-Id: {getXStoreIdHeaderValue(stored)}</code>
             {savedAt ? <> · Saved {savedAt}</> : null}
           </p>
-          <nav style={{ display: "flex", gap: "0.75rem", marginTop: "1rem" }}>
+          <nav style={{ display: "flex", gap: "0.75rem", marginTop: "1rem", flexWrap: "wrap" }}>
             <Link to="/kds" style={primaryLink}>
               Open KDS
+            </Link>
+            <Link to="/tms" style={primaryLink}>
+              Open TMS
             </Link>
           </nav>
         </section>

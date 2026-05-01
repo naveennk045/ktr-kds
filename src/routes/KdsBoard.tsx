@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Link, Navigate } from "react-router-dom";
 import { fetchKdsBoard, kdsWebSocketUrl, patchKdsLineStatus } from "../lib/api";
-import { nextOrderItemStatus, statusLabel } from "../lib/status";
+import { getLineCounters, lineVisualPhase, parseOptionalBatchQuantity } from "../lib/lineCounters";
 import { getXStoreIdHeaderValue, readStoredStore } from "../lib/storeContext";
-import type { KdsBoardPayload, KdsLine, WsEnvelope } from "../lib/types";
+import type { KdsBoardPayload, KdsLine, OrderItemStatus, WsEnvelope } from "../lib/types";
 
 const POLL_MS = 10_000;
 const DEFAULT_MAX_ROWS = 20;
@@ -16,6 +16,7 @@ export default function KdsBoard() {
   const [wsHint, setWsHint] = useState<string>("Connecting…");
   const [lineBusy, setLineBusy] = useState<number | null>(null);
   const [tick, setTick] = useState(0);
+  const [batchByLineId, setBatchByLineId] = useState<Record<number, string>>({});
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const completedAtRef = useRef<Record<number, number>>({});
 
@@ -72,7 +73,11 @@ export default function KdsBoard() {
         if (msg.type === "SNAPSHOT" && msg.payload && "orders" in msg.payload) {
           setBoard(msg.payload as KdsBoardPayload);
           setLoadError(null);
-        } else if (msg.type === "BOARD_REFRESH" || msg.type === "ITEM_STATUS_CHANGED") {
+        } else if (
+          msg.type === "BOARD_REFRESH" ||
+          msg.type === "ITEM_STATUS_CHANGED" ||
+          msg.type === "TMS_ANNOUNCE"
+        ) {
           void refetch();
         } else if (msg.type === "PING") {
           /* ignore */
@@ -136,14 +141,36 @@ export default function KdsBoard() {
     return { ...board, orders: nextOrders };
   }, [board, tick]);
 
-  async function advanceLine(line: KdsLine) {
+  async function sendPatch(
+    line: KdsLine,
+    status: OrderItemStatus,
+    capForBatch: number,
+    useBatchField: boolean,
+  ) {
     if (!stored) return;
-    const next = nextOrderItemStatus(line.order_status);
-    if (!next) return;
+    const raw = useBatchField ? (batchByLineId[line.id] ?? "") : "";
+    let quantity: number | undefined;
+    if (status !== "PREPARING") {
+      const kind = status === "READY" ? "ready" : "collected";
+      const parsed = parseOptionalBatchQuantity(raw, capForBatch, kind);
+      if (!parsed.ok) {
+        setLoadError(parsed.message);
+        return;
+      }
+      // Blank batch = "all remaining for this tap". Send an explicit `quantity` equal to the
+      // current counter — omitting `quantity` makes some servers use the line *ordered* total,
+      // which breaks after partial READY (e.g. 3 ordered, 1 left in kitchen → error if omitted).
+      quantity =
+        parsed.quantity !== undefined
+          ? parsed.quantity
+          : capForBatch > 0
+            ? capForBatch
+            : undefined;
+    }
     setLineBusy(line.id);
     setLoadError(null);
     try {
-      await patchKdsLineStatus(xStore, line.id, next);
+      await patchKdsLineStatus(xStore, line.id, status, quantity);
       await refetch();
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : "Update failed");
@@ -166,6 +193,9 @@ export default function KdsBoard() {
           </div>
         </div>
         <nav style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
+          <Link to="/tms" style={linkMuted}>
+            TMS
+          </Link>
           <Link to="/" style={linkMuted}>
             Setup
           </Link>
@@ -179,7 +209,7 @@ export default function KdsBoard() {
       )}
 
       <section style={clubbedStrip}>
-        <h2 style={{ margin: 0, fontSize: "1rem", color: "var(--text-secondary)" }}>Clubbed Summary</h2>
+        <h2 style={{ margin: 0, fontSize: "1rem", color: "var(--text-secondary)" }}>Clubbed summary</h2>
         {!visibleBoard || visibleBoard.clubbed_totals.length === 0 ? (
           <p style={{ color: "var(--muted)", margin: "0.5rem 0 0" }}>No open items.</p>
         ) : (
@@ -194,6 +224,8 @@ export default function KdsBoard() {
         )}
         {visibleBoard && (
           <p style={{ marginTop: "0.6rem", fontSize: "0.8rem", color: "var(--muted)" }}>
+            Totals are <strong>ordered</strong> volume (not “still in kitchen”). Use per-line “Kitchen” counts below.
+            <br />
             Window {visibleBoard.live_window_minutes}m · max {visibleBoard.max_rows} tickets
           </p>
         )}
@@ -205,55 +237,102 @@ export default function KdsBoard() {
       )}
       <div className="kds-ticket-grid" style={ticketGrid}>
         {visibleBoard?.orders.map((order) => {
-          let orderTypeText = order.order_type;
+          let orderTypeText: string | undefined = order.order_type;
           if (order.order_type === "DINEIN") orderTypeText = "Dine-in";
           if (order.order_type === "TAKEAWAY") orderTypeText = "Takeaway";
           return (
             <article key={order.id} style={ticket}>
-            <div style={ticketHead}>
-              <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minWidth: 0 }}>
-                <span style={kot}>{order.kot_code}</span>
-                {orderTypeText ? <span style={orderTypeBadge}>{orderTypeText}</span> : null}
+              <div style={ticketHead}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minWidth: 0 }}>
+                  <span style={kot}>{order.kot_code}</span>
+                  {orderTypeText ? <span style={orderTypeBadge}>{orderTypeText}</span> : null}
+                </div>
+                <span style={{ color: "var(--muted)", fontSize: "0.85rem", textAlign: "right" }}>
+                  {new Date(order.created_at).toLocaleString()}
+                </span>
               </div>
-              <span style={{ color: "var(--muted)", fontSize: "0.85rem", textAlign: "right" }}>
-                {new Date(order.created_at).toLocaleString()}
-              </span>
-            </div>
               <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-              {order.lines.map((line) => {
-                const next = nextOrderItemStatus(line.order_status);
-                let visualStatus: "PREPARING" | "READY" | "COLLECTED" = "PREPARING";
-                if (line.order_status === "READY") {
-                  visualStatus = "READY";
-                } else if (line.order_status === "COLLECTED") {
-                  visualStatus = "COLLECTED";
-                }
-                return (
-                  <li key={line.id} style={lineRow(visualStatus)}>
-                    <div>
-                      <div style={{ ...lineItemText, fontWeight: 600 }}>{line.item_name}</div>
-                      <div style={{ fontSize: "0.85rem", color: "var(--muted)" }}>
-                        ×{line.quantity} · {statusLabel(line.order_status)}
+                {order.lines.map((line) => {
+                  const c = getLineCounters(line);
+                  const visual = lineVisualPhase(c);
+                  const busy = lineBusy === line.id;
+                  const showAccept = line.order_status === "NOT_ACCEPTED";
+                  const showReady = c.items_need_be_ready > 0;
+                  const showCollect = c.items_need_be_collected > 0;
+                  const anyAction = showAccept || showReady || showCollect;
+                  const showBatchField =
+                    (showReady && c.items_need_be_ready > 1) ||
+                    (showCollect && c.items_need_be_collected > 1);
+
+                  return (
+                    <li key={line.id} style={lineRow(visual)}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ ...lineItemText, fontWeight: 600 }}>{line.item_name}</div>
+                        <div style={{ fontSize: "0.85rem", color: "var(--muted)" }}>
+                          Ordered ×{line.quantity} · Kitchen {c.items_need_be_ready} · Counter{" "}
+                          {c.items_need_be_collected}
+                        </div>
+                        {showBatchField ? (
+                          <label style={batchRow}>
+                            <span style={{ color: "var(--muted)", whiteSpace: "nowrap" }}>Batch qty</span>
+                            <input
+                              type="number"
+                              min={1}
+                              max={Math.max(c.items_need_be_ready, c.items_need_be_collected, 1)}
+                              inputMode="numeric"
+                              placeholder="All"
+                              value={batchByLineId[line.id] ?? ""}
+                              disabled={busy}
+                              onChange={(e) =>
+                                setBatchByLineId((m) => ({ ...m, [line.id]: e.target.value }))
+                              }
+                              style={qtyInput}
+                              aria-label={`Batch quantity for ${line.item_name}`}
+                            />
+                          </label>
+                        ) : null}
                       </div>
-                    </div>
-                    {next ? (
-                      <button
-                        type="button"
-                        style={advanceBtn}
-                        disabled={lineBusy === line.id}
-                        onClick={() => void advanceLine(line)}
-                      >
-                        {next === "READY" ? "Mark Ready" : "Mark Collected"}
-                      </button>
-                    ) : (
-                      <span style={{ color: "var(--ready)", fontSize: "0.85rem" }}>
-                        {statusLabel(line.order_status)}
-                      </span>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
+                      <div style={actionCol}>
+                        {showAccept ? (
+                          <button
+                            type="button"
+                            style={advanceBtn}
+                            disabled={busy}
+                            onClick={() => void sendPatch(line, "PREPARING", 0, false)}
+                          >
+                            Start
+                          </button>
+                        ) : null}
+                        {showReady ? (
+                          <button
+                            type="button"
+                            style={advanceBtn}
+                            disabled={busy}
+                            onClick={() => void sendPatch(line, "READY", c.items_need_be_ready, showBatchField)}
+                          >
+                            Ready
+                          </button>
+                        ) : null}
+                        {showCollect ? (
+                          <button
+                            type="button"
+                            style={{ ...advanceBtn, background: "var(--gold-primary)", color: "var(--text-on-dark)" }}
+                            disabled={busy}
+                            onClick={() =>
+                              void sendPatch(line, "COLLECTED", c.items_need_be_collected, showBatchField)
+                            }
+                          >
+                            Collected
+                          </button>
+                        ) : null}
+                        {!anyAction ? (
+                          <span style={{ color: "var(--ready)", fontSize: "0.85rem" }}>Done</span>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
             </article>
           );
         })}
@@ -352,7 +431,7 @@ const orderTypeBadge: CSSProperties = {
 const lineBase: CSSProperties = {
   display: "flex",
   justifyContent: "space-between",
-  alignItems: "center",
+  alignItems: "stretch",
   gap: "0.75rem",
   padding: "0.5rem 0",
   borderTop: "1px solid var(--neutral-300)",
@@ -362,6 +441,32 @@ const lineItemText: CSSProperties = {
   wordBreak: "break-word",
   overflowWrap: "anywhere",
 };
+
+const batchRow: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: "0.45rem",
+  marginTop: "0.35rem",
+  fontSize: "0.78rem",
+};
+
+const qtyInput: CSSProperties = {
+  width: "4.5rem",
+  padding: "0.2rem 0.35rem",
+  borderRadius: 6,
+  border: "1px solid var(--border-primary)",
+  background: "var(--neutral-50)",
+  color: "var(--text-primary)",
+};
+
+const actionCol: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: "0.35rem",
+  justifyContent: "center",
+  alignItems: "stretch",
+};
+
 function lineRow(status: "PREPARING" | "READY" | "COLLECTED"): CSSProperties {
   if (status === "COLLECTED") {
     return {
