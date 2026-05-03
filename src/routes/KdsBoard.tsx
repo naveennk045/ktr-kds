@@ -272,25 +272,64 @@ export default function KdsBoard() {
                           Ordered ×{line.quantity} · Kitchen {c.items_need_be_ready} · Counter{" "}
                           {c.items_need_be_collected}
                         </div>
-                        {showBatchField ? (
-                          <label style={batchRow}>
-                            <span style={{ color: "var(--muted)", whiteSpace: "nowrap" }}>Batch qty</span>
-                            <input
-                              type="number"
-                              min={1}
-                              max={Math.max(c.items_need_be_ready, c.items_need_be_collected, 1)}
-                              inputMode="numeric"
-                              placeholder="All"
-                              value={batchByLineId[line.id] ?? ""}
-                              disabled={busy}
-                              onChange={(e) =>
-                                setBatchByLineId((m) => ({ ...m, [line.id]: e.target.value }))
-                              }
-                              style={qtyInput}
-                              aria-label={`Batch quantity for ${line.item_name}`}
-                            />
-                          </label>
-                        ) : null}
+                        {showBatchField ? (() => {
+                          const maxQty = showReady ? c.items_need_be_ready : Math.max(c.items_need_be_collected, 1);
+                          const currentQtyStr = batchByLineId[line.id];
+                          const displayQty = currentQtyStr !== undefined ? currentQtyStr : maxQty;
+                          const numQty = displayQty === "" ? 1 : Number(displayQty);
+                          
+                          const handleDec = () => {
+                            if (busy || numQty <= 1) return;
+                            setBatchByLineId((m) => ({ ...m, [line.id]: String(numQty - 1) }));
+                          };
+                          
+                          const handleInc = () => {
+                            if (busy || numQty >= maxQty) return;
+                            setBatchByLineId((m) => ({ ...m, [line.id]: String(numQty + 1) }));
+                          };
+
+                          return (
+                            <div style={batchRow}>
+                              <span style={{ color: "var(--muted)", whiteSpace: "nowrap" }}>Batch qty</span>
+                              <div style={qtyWrapper}>
+                                <button
+                                  type="button"
+                                  disabled={busy || numQty <= 1}
+                                  onClick={handleDec}
+                                  style={{ ...qtyBtn, opacity: (busy || numQty <= 1) ? 0.5 : 1 }}
+                                >
+                                  -
+                                </button>
+                                <input
+                                  type="text"
+                                  inputMode="numeric"
+                                  value={displayQty}
+                                  disabled={busy}
+                                  onChange={(e) => {
+                                    const valStr = e.target.value.replace(/[^0-9]/g, '');
+                                    if (valStr === "") {
+                                      setBatchByLineId((m) => ({ ...m, [line.id]: "" }));
+                                    } else {
+                                      let val = parseInt(valStr, 10);
+                                      if (val > maxQty) val = maxQty;
+                                      setBatchByLineId((m) => ({ ...m, [line.id]: String(val) }));
+                                    }
+                                  }}
+                                  style={qtyInputCenter}
+                                  aria-label={`Batch quantity for ${line.item_name}`}
+                                />
+                                <button
+                                  type="button"
+                                  disabled={busy || numQty >= maxQty}
+                                  onClick={handleInc}
+                                  style={{ ...qtyBtn, opacity: (busy || numQty >= maxQty) ? 0.5 : 1 }}
+                                >
+                                  +
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })() : null}
                       </div>
                       <div style={actionCol}>
                         {showAccept ? (
@@ -450,13 +489,38 @@ const batchRow: CSSProperties = {
   fontSize: "0.78rem",
 };
 
-const qtyInput: CSSProperties = {
-  width: "4.5rem",
-  padding: "0.2rem 0.35rem",
-  borderRadius: 6,
+const qtyWrapper: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
   border: "1px solid var(--border-primary)",
+  borderRadius: 6,
   background: "var(--neutral-50)",
+  overflow: "hidden",
+};
+
+const qtyBtn: CSSProperties = {
+  background: "var(--bg-warm)",
+  border: "none",
   color: "var(--text-primary)",
+  padding: "0.15rem 0.6rem",
+  fontSize: "1.1rem",
+  fontWeight: "bold",
+  cursor: "pointer",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+};
+
+const qtyInputCenter: CSSProperties = {
+  width: "2.5rem",
+  textAlign: "center",
+  border: "none",
+  borderLeft: "1px solid var(--border-primary)",
+  borderRight: "1px solid var(--border-primary)",
+  background: "transparent",
+  color: "var(--text-primary)",
+  padding: "0.2rem 0",
+  fontSize: "0.9rem",
 };
 
 const actionCol: CSSProperties = {
