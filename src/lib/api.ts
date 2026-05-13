@@ -57,6 +57,22 @@ export async function patchKdsLineStatus(
   return parseJson(res);
 }
 
+export async function announceKdsItem(xStoreId: string, lineId: number): Promise<unknown> {
+  const res = await fetch(buildUrl(`/kds/items/${lineId}/announce`), {
+    method: "POST",
+    headers: { "X-Store-Id": xStoreId },
+  });
+  return parseJson(res);
+}
+
+export async function announceKdsOrder(xStoreId: string, orderId: number): Promise<unknown> {
+  const res = await fetch(buildUrl(`/kds/orders/${orderId}/announce`), {
+    method: "POST",
+    headers: { "X-Store-Id": xStoreId },
+  });
+  return parseJson(res);
+}
+
 export async function fetchTmsSnapshot(xStoreId: string): Promise<TmsSnapshotPayload> {
   const res = await fetch(buildUrl("/tms/snapshot"), {
     headers: { "X-Store-Id": xStoreId },

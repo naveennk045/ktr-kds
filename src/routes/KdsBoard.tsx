@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Link, Navigate } from "react-router-dom";
-import { fetchKdsBoard, kdsWebSocketUrl, patchKdsLineStatus } from "../lib/api";
+import { fetchKdsBoard, kdsWebSocketUrl, patchKdsLineStatus, announceKdsItem, announceKdsOrder } from "../lib/api";
 import { getLineCounters, lineVisualPhase, parseOptionalBatchQuantity } from "../lib/lineCounters";
 import { getXStoreIdHeaderValue, readStoredStore } from "../lib/storeContext";
 import type { KdsBoardPayload, KdsLine, OrderItemStatus, WsEnvelope } from "../lib/types";
@@ -15,12 +15,20 @@ export default function KdsBoard() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [wsHint, setWsHint] = useState<string>("Connecting…");
   const [lineBusy, setLineBusy] = useState<number | null>(null);
+  const [announcingLineId, setAnnouncingLineId] = useState<number | null>(null);
+  const [announcingOrderId, setAnnouncingOrderId] = useState<number | null>(null);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [batchByLineId, setBatchByLineId] = useState<Record<number, string>>({});
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const completedAtRef = useRef<Record<number, number>>({});
 
   const xStore = stored ? getXStoreIdHeaderValue(stored) : "";
+
+  const showToast = useCallback((msg: string) => {
+    setToastMsg(msg);
+    setTimeout(() => setToastMsg(null), 3000);
+  }, []);
 
   const refetch = useCallback(async () => {
     if (!stored) return;
@@ -179,6 +187,34 @@ export default function KdsBoard() {
     }
   }
 
+  async function handleAnnounceItem(lineId: number) {
+    if (!stored) return;
+    setAnnouncingLineId(lineId);
+    setLoadError(null);
+    try {
+      await announceKdsItem(xStore, lineId);
+      showToast("Item announcement triggered");
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Failed to announce item");
+    } finally {
+      setAnnouncingLineId(null);
+    }
+  }
+
+  async function handleAnnounceOrder(orderId: number) {
+    if (!stored) return;
+    setAnnouncingOrderId(orderId);
+    setLoadError(null);
+    try {
+      await announceKdsOrder(xStore, orderId);
+      showToast("Order announcement triggered");
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Failed to announce order");
+    } finally {
+      setAnnouncingOrderId(null);
+    }
+  }
+
   if (!stored) {
     return <Navigate to="/" replace />;
   }
@@ -205,6 +241,11 @@ export default function KdsBoard() {
       {loadError && (
         <div style={errBox} role="alert">
           {loadError}
+        </div>
+      )}
+      {toastMsg && (
+        <div style={successBox} role="alert">
+          {toastMsg}
         </div>
       )}
 
@@ -240,12 +281,28 @@ export default function KdsBoard() {
           let orderTypeText: string | undefined = order.order_type;
           if (order.order_type === "DINEIN") orderTypeText = "Dine-in";
           if (order.order_type === "TAKEAWAY") orderTypeText = "Takeaway";
+          
+          const isCompletelyReady = order.lines.length > 0 &&
+            order.lines.every((l) => getLineCounters(l).items_need_be_ready === 0) &&
+            order.lines.some((l) => getLineCounters(l).items_need_be_collected > 0);
+
           return (
             <article key={order.id} style={ticket}>
               <div style={ticketHead}>
-                <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minWidth: 0, flexWrap: "wrap" }}>
                   <span style={kot}>{order.kot_code}</span>
                   {orderTypeText ? <span style={orderTypeBadge}>{orderTypeText}</span> : null}
+                  {isCompletelyReady ? (
+                    <button
+                      type="button"
+                      style={announceBtn}
+                      disabled={announcingOrderId === order.id}
+                      onClick={() => void handleAnnounceOrder(order.id)}
+                      title="Announce Order"
+                    >
+                      <MegaphoneIcon size={14} /> Announce
+                    </button>
+                  ) : null}
                 </div>
                 <span style={{ color: "var(--muted)", fontSize: "0.85rem", textAlign: "right" }}>
                   {new Date(order.created_at).toLocaleString()}
@@ -353,16 +410,27 @@ export default function KdsBoard() {
                           </button>
                         ) : null}
                         {showCollect ? (
-                          <button
-                            type="button"
-                            style={{ ...advanceBtn, background: "var(--gold-primary)", color: "var(--text-on-dark)" }}
-                            disabled={busy}
-                            onClick={() =>
-                              void sendPatch(line, "COLLECTED", c.items_need_be_collected, showBatchField)
-                            }
-                          >
-                            Collected
-                          </button>
+                          <div style={{ display: "flex", gap: "0.35rem" }}>
+                            <button
+                              type="button"
+                              style={{ ...advanceBtn, flex: 1, background: "var(--gold-primary)", color: "var(--text-on-dark)" }}
+                              disabled={busy}
+                              onClick={() =>
+                                void sendPatch(line, "COLLECTED", c.items_need_be_collected, showBatchField)
+                              }
+                            >
+                              Collected
+                            </button>
+                            <button
+                              type="button"
+                              style={{ ...announceBtn, padding: "0.35rem 0.5rem" }}
+                              disabled={announcingLineId === line.id}
+                              onClick={() => void handleAnnounceItem(line.id)}
+                              title="Announce Item"
+                            >
+                              <MegaphoneIcon size={14} />
+                            </button>
+                          </div>
                         ) : null}
                         {!anyAction ? (
                           <span style={{ color: "var(--ready)", fontSize: "0.85rem" }}>Done</span>
@@ -396,6 +464,15 @@ const errBox: CSSProperties = {
   padding: "0.65rem 0.85rem",
   borderRadius: 8,
   marginBottom: "1rem",
+};
+const successBox: CSSProperties = {
+  background: "rgba(52, 168, 83, 0.12)",
+  border: "1px solid var(--success, #34a853)",
+  color: "var(--success-dark, #2e7d32)",
+  padding: "0.65rem 0.85rem",
+  borderRadius: 8,
+  marginBottom: "1rem",
+  fontWeight: 600,
 };
 const clubbedStrip: CSSProperties = {
   background: "var(--neutral-50)",
@@ -565,3 +642,35 @@ const advanceBtn: CSSProperties = {
   fontWeight: 600,
   whiteSpace: "nowrap",
 };
+const announceBtn: CSSProperties = {
+  padding: "0.2rem 0.5rem",
+  borderRadius: 6,
+  border: "1px solid var(--border-primary)",
+  background: "var(--bg-cream)",
+  color: "var(--text-primary)",
+  cursor: "pointer",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: "0.35rem",
+  fontSize: "0.9rem",
+};
+
+function MegaphoneIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="m3 11 18-5v12L3 14v-3z" />
+      <path d="M11.6 16.8a3 3 0 1 1-5.8-1.6" />
+    </svg>
+  );
+}
