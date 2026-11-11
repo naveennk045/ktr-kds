@@ -1,676 +1,345 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { Link, Navigate } from "react-router-dom";
-import { fetchKdsBoard, kdsWebSocketUrl, patchKdsLineStatus, announceKdsItem, announceKdsOrder } from "../lib/api";
-import { getLineCounters, lineVisualPhase, parseOptionalBatchQuantity } from "../lib/lineCounters";
-import { getXStoreIdHeaderValue, readStoredStore } from "../lib/storeContext";
-import type { KdsBoardPayload, KdsLine, OrderItemStatus, WsEnvelope } from "../lib/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Navigate } from "react-router-dom";
+import KdsShell, { ModChip } from "../components/KdsShell";
+import { getLineCounters } from "../lib/lineCounters";
+import { STATIONS, inStation, useMenuIndex, type StationId } from "../lib/menuMeta";
+import { clock, tokenOf, useKdsBoard, type LineMove } from "../lib/useKdsBoard";
+import type { KdsLine, KdsOrder } from "../lib/types";
 
-const POLL_MS = 10_000;
-const DEFAULT_MAX_ROWS = 20;
-const HIDE_COMPLETED_AFTER_MS = 5_000;
+const STATION_KEY = "ktr-kds-station";
+const HIDE_DONE_AFTER_MS = 5_000;
+const WARN_MIN = 5;
+const LATE_MIN = 10;
+
+type TicketState = "new" | "cooking" | "partial" | "ready";
+
+function readStation(): StationId {
+  try {
+    const v = localStorage.getItem(STATION_KEY);
+    if (STATIONS.some((s) => s.id === v)) return v as StationId;
+  } catch {
+    /* ignore */
+  }
+  return "all";
+}
+
+function isParcel(order: KdsOrder, line: KdsLine): boolean {
+  return (line.order_type ?? order.order_type) === "TAKEAWAY";
+}
+
+function ticketState(order: KdsOrder): TicketState {
+  const cs = order.lines.map(getLineCounters);
+  const toMake = cs.reduce((n, c) => n + c.items_need_be_ready, 0);
+  const atCounter = cs.reduce((n, c) => n + c.items_need_be_collected, 0);
+  if (toMake === 0) return "ready";
+  if (atCounter > 0 || order.lines.some((l) => l.order_status === "READY" || l.order_status === "COLLECTED")) return "partial";
+  return order.lines.some((l) => l.order_status === "PREPARING") ? "cooking" : "new";
+}
 
 export default function KdsBoard() {
-  const stored = useMemo(() => readStoredStore(), []);
-  const [board, setBoard] = useState<KdsBoardPayload | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [wsHint, setWsHint] = useState<string>("Connecting…");
-  const [lineBusy, setLineBusy] = useState<number | null>(null);
-  const [announcingLineId, setAnnouncingLineId] = useState<number | null>(null);
-  const [announcingOrderId, setAnnouncingOrderId] = useState<number | null>(null);
-  const [toastMsg, setToastMsg] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
-  const [batchByLineId, setBatchByLineId] = useState<Record<number, string>>({});
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const completedAtRef = useRef<Record<number, number>>({});
+  const { stored, board, error, live, busy, now, move, announceOrder } = useKdsBoard();
+  const menu = useMenuIndex();
+  const [station, setStation] = useState<StationId>(readStation);
+  const [partQty, setPartQty] = useState<Record<number, number>>({});
+  const [toast, setToast] = useState<string | null>(null);
+  const doneAt = useRef<Record<number, number>>({});
+  const seen = useRef<Set<number> | null>(null);
+  const [fresh, setFresh] = useState<Set<number>>(() => new Set());
 
-  const xStore = stored ? getXStoreIdHeaderValue(stored) : "";
-
-  const showToast = useCallback((msg: string) => {
-    setToastMsg(msg);
-    setTimeout(() => setToastMsg(null), 3000);
-  }, []);
-
-  const refetch = useCallback(async () => {
-    if (!stored) return;
-    setLoadError(null);
+  const pickStation = (id: StationId) => {
+    setStation(id);
     try {
-      const b = await fetchKdsBoard(xStore, DEFAULT_MAX_ROWS);
-      setBoard(b);
-    } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Failed to load board");
+      localStorage.setItem(STATION_KEY, id);
+    } catch {
+      /* ignore */
     }
-  }, [stored, xStore]);
+  };
 
   useEffect(() => {
-    void refetch();
-  }, [refetch]);
+    if (!toast) return undefined;
+    const t = setTimeout(() => setToast(null), 2500);
+    return () => clearTimeout(t);
+  }, [toast]);
 
+  // Tickets that arrived since the last snapshot slide in.
   useEffect(() => {
-    if (!stored) return;
-
-    let cancelled = false;
-    const clearPoll = () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
-
-    const startPoll = () => {
-      clearPoll();
-      pollRef.current = setInterval(() => {
-        void refetch();
-      }, POLL_MS);
-      setWsHint("Polling (WebSocket unavailable)");
-    };
-
-    const url = kdsWebSocketUrl(stored.storeId, DEFAULT_MAX_ROWS);
-    setWsHint("Connecting…");
-    const ws = new WebSocket(url);
-
-    ws.onopen = () => {
-      if (cancelled) return;
-      setWsHint("Live (WebSocket)");
-      clearPoll();
-    };
-
-    ws.onmessage = (ev) => {
-      if (cancelled) return;
-      try {
-        const msg = JSON.parse(String(ev.data)) as WsEnvelope<KdsBoardPayload | Record<string, unknown>>;
-        if (msg.type === "SNAPSHOT" && msg.payload && "orders" in msg.payload) {
-          setBoard(msg.payload as KdsBoardPayload);
-          setLoadError(null);
-        } else if (
-          msg.type === "BOARD_REFRESH" ||
-          msg.type === "ITEM_STATUS_CHANGED" ||
-          msg.type === "TMS_ANNOUNCE"
-        ) {
-          void refetch();
-        } else if (msg.type === "PING") {
-          /* ignore */
-        }
-      } catch {
-        /* ignore malformed frames */
-      }
-    };
-
-    ws.onerror = () => {
-      if (cancelled) return;
-      startPoll();
-    };
-
-    ws.onclose = () => {
-      if (cancelled) return;
-      startPoll();
-    };
-
-    return () => {
-      cancelled = true;
-      clearPoll();
-      ws.close();
-    };
-  }, [stored, refetch]);
-
-  useEffect(() => {
-    const id = globalThis.setInterval(() => setTick((n) => n + 1), 1000);
-    return () => globalThis.clearInterval(id);
-  }, []);
-
-  const visibleBoard = useMemo(() => {
-    const now = Date.now() + tick * 0;
-    if (!board) return null;
-    const activeLineIds = new Set<number>();
-    const nextOrders = board.orders
-      .map((order) => {
-        const visibleLines = order.lines.filter((line) => {
-          activeLineIds.add(line.id);
-          const isCompleted = line.order_status === "COLLECTED";
-          if (!isCompleted) {
-            delete completedAtRef.current[line.id];
-            return true;
-          }
-          if (!completedAtRef.current[line.id]) {
-            completedAtRef.current[line.id] = now;
-          }
-          return now - completedAtRef.current[line.id] < HIDE_COMPLETED_AFTER_MS;
-        });
-        return { ...order, lines: visibleLines };
-      })
-      .filter((order) => order.lines.length > 0);
-
-    for (const key of Object.keys(completedAtRef.current)) {
-      const id = Number(key);
-      if (!activeLineIds.has(id)) {
-        delete completedAtRef.current[id];
+    if (!board) return;
+    const ids = new Set(board.orders.map((o) => o.id));
+    if (seen.current) {
+      const added = [...ids].filter((id) => !seen.current!.has(id));
+      if (added.length) {
+        setFresh(new Set(added));
+        setTimeout(() => setFresh(new Set()), 1200);
       }
     }
+    seen.current = ids;
+  }, [board]);
 
-    return { ...board, orders: nextOrders };
-  }, [board, tick]);
-
-  async function sendPatch(
-    line: KdsLine,
-    status: OrderItemStatus,
-    capForBatch: number,
-    useBatchField: boolean,
-  ) {
-    if (!stored) return;
-    const raw = useBatchField ? (batchByLineId[line.id] ?? "") : "";
-    let quantity: number | undefined;
-    if (status !== "PREPARING") {
-      const kind = status === "READY" ? "ready" : "collected";
-      const parsed = parseOptionalBatchQuantity(raw, capForBatch, kind);
-      if (!parsed.ok) {
-        setLoadError(parsed.message);
-        return;
+  // Fully collected tickets linger a few seconds, then leave the board.
+  const orders = useMemo(() => {
+    if (!board) return [];
+    const liveIds = new Set<number>();
+    const out = board.orders.filter((o) => {
+      liveIds.add(o.id);
+      const done = o.lines.length > 0 && o.lines.every((l) => l.order_status === "COLLECTED");
+      if (!done) {
+        delete doneAt.current[o.id];
+        return true;
       }
-      // Blank batch = "all remaining for this tap". Send an explicit `quantity` equal to the
-      // current counter — omitting `quantity` makes some servers use the line *ordered* total,
-      // which breaks after partial READY (e.g. 3 ordered, 1 left in kitchen → error if omitted).
-      quantity =
-        parsed.quantity !== undefined
-          ? parsed.quantity
-          : capForBatch > 0
-            ? capForBatch
-            : undefined;
-    }
-    setLineBusy(line.id);
-    setLoadError(null);
-    try {
-      await patchKdsLineStatus(xStore, line.id, status, quantity);
-      await refetch();
-    } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Update failed");
-    } finally {
-      setLineBusy(null);
-    }
-  }
+      doneAt.current[o.id] ??= now;
+      return now - doneAt.current[o.id] < HIDE_DONE_AFTER_MS;
+    });
+    for (const k of Object.keys(doneAt.current)) if (!liveIds.has(Number(k))) delete doneAt.current[Number(k)];
+    return out;
+  }, [board, now]);
 
-  async function handleAnnounceItem(lineId: number) {
-    if (!stored) return;
-    setAnnouncingLineId(lineId);
-    setLoadError(null);
-    try {
-      await announceKdsItem(xStore, lineId);
-      showToast("Item announcement triggered");
-    } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Failed to announce item");
-    } finally {
-      setAnnouncingLineId(null);
+  // Kitchen summary: what is still to make, added up by dish for this station.
+  const summary = useMemo(() => {
+    const g = new Map<string, { qty: number; toStart: number; cooking: number; mods: Map<string, number>; notes: number; parcel: number; tokens: string[] }>();
+    for (const o of orders) {
+      for (const l of o.lines) {
+        const c = getLineCounters(l);
+        if (c.items_need_be_ready <= 0 || !inStation(menu, station, l.item_name)) continue;
+        const x = g.get(l.item_name) ?? { qty: 0, toStart: 0, cooking: 0, mods: new Map<string, number>(), notes: 0, parcel: 0, tokens: [] as string[] };
+        x.qty += c.items_need_be_ready;
+        if (l.order_status === "NOT_ACCEPTED") x.toStart += c.items_need_be_ready;
+        else x.cooking += c.items_need_be_ready;
+        for (const m of l.options ?? []) x.mods.set(m, (x.mods.get(m) ?? 0) + c.items_need_be_ready);
+        if (l.note) x.notes += 1;
+        if (isParcel(o, l)) x.parcel += c.items_need_be_ready;
+        const tok = tokenOf(o.kot_code);
+        if (!x.tokens.includes(tok)) x.tokens.push(tok);
+        g.set(l.item_name, x);
+      }
     }
-  }
+    return [...g.entries()].sort((a, b) => b[1].qty - a[1].qty);
+  }, [orders, menu, station]);
+  const totalToMake = summary.reduce((n, [, x]) => n + x.qty, 0);
 
-  async function handleAnnounceOrder(orderId: number) {
-    if (!stored) return;
-    setAnnouncingOrderId(orderId);
-    setLoadError(null);
-    try {
-      await announceKdsOrder(xStore, orderId);
-      showToast("Order announcement triggered");
-    } catch (e) {
-      setLoadError(e instanceof Error ? e.message : "Failed to announce order");
-    } finally {
-      setAnnouncingOrderId(null);
+  const tickets = useMemo(() => {
+    const list = orders.filter((o) => station === "all" || o.lines.some((l) => inStation(menu, station, l.item_name)));
+    return list.sort((a, b) => {
+      const ra = ticketState(a) === "ready";
+      const rb = ticketState(b) === "ready";
+      if (ra !== rb) return ra ? 1 : -1;
+      return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+    });
+  }, [orders, menu, station]);
+
+  if (!stored) return <Navigate to="/" replace />;
+
+  const where = STATIONS.find((s) => s.id === station)?.where ?? "all stations";
+
+  const allReady = (o: KdsOrder) => {
+    const moves: LineMove[] = [];
+    for (const l of o.lines) {
+      const c = getLineCounters(l);
+      if (c.items_need_be_ready > 0) moves.push({ lineId: l.id, status: "READY", quantity: c.items_need_be_ready });
     }
-  }
-
-  if (!stored) {
-    return <Navigate to="/" replace />;
-  }
+    void move(moves);
+  };
+  const allCollected = (o: KdsOrder) => {
+    const moves: LineMove[] = [];
+    for (const l of o.lines) {
+      const c = getLineCounters(l);
+      if (c.items_need_be_collected > 0) moves.push({ lineId: l.id, status: "COLLECTED", quantity: c.items_need_be_collected });
+    }
+    void move(moves);
+  };
 
   return (
-    <div style={page}>
-      <header style={topBar}>
-        <div>
-          <h1 style={{ margin: 0, fontSize: "1.35rem" }}>Kitchen display</h1>
-          <div style={{ color: "var(--muted)", fontSize: "0.9rem", marginTop: 4 }}>
-            {stored.storeName} · {wsHint}
-          </div>
+    <KdsShell
+      storeName={stored.storeName}
+      live={live}
+      now={now}
+      error={error}
+      tools={
+        <div className="kx-seg kx-stations" role="group" aria-label="Station">
+          {STATIONS.map((s) => (
+            <button key={s.id} type="button" aria-pressed={station === s.id} onClick={() => pickStation(s.id)}>
+              {s.label}
+            </button>
+          ))}
         </div>
-        <nav style={{ display: "flex", gap: "0.75rem", alignItems: "center" }}>
-          <Link to="/tms" style={linkMuted}>
-            TMS
-          </Link>
-          <Link to="/" style={linkMuted}>
-            Setup
-          </Link>
-        </nav>
-      </header>
-
-      {loadError && (
-        <div style={errBox} role="alert">
-          {loadError}
+      }
+    >
+      <section className="kx-summary" aria-labelledby="h-sum">
+        <div className="kx-head">
+          <h2 id="h-sum">
+            Kitchen summary
+            {totalToMake > 0 && <span className="kx-sub">{totalToMake} to make at {where}</span>}
+          </h2>
         </div>
-      )}
-      {toastMsg && (
-        <div style={successBox} role="alert">
-          {toastMsg}
-        </div>
-      )}
-
-      <section style={clubbedStrip}>
-        <h2 style={{ margin: 0, fontSize: "1rem", color: "var(--text-secondary)" }}>Clubbed summary</h2>
-        {!visibleBoard || visibleBoard.clubbed_totals.length === 0 ? (
-          <p style={{ color: "var(--muted)", margin: "0.5rem 0 0" }}>No open items.</p>
+        {summary.length === 0 ? (
+          <div className="kx-empty">Nothing waiting at {where}. New tickets add up here by dish.</div>
         ) : (
-          <div style={clubbedChipWrap}>
-            {visibleBoard.clubbed_totals.map((row) => (
-              <div key={row.item_name} style={clubbedChip}>
-                <span style={clubbedQty}>{row.quantity}</span>
-                <span style={clubbedName}>{row.item_name}</span>
+          <div className="kx-sum-grid">
+            {summary.map(([name, x]) => (
+              <div key={name} className={`kx-sum-card ${x.qty >= 4 ? "hot" : ""}`}>
+                <div className="kx-sum-top">
+                  <span className="kx-sum-qty">{x.qty}</span>
+                  <span className="kx-sum-name">{name}</span>
+                </div>
+                <div className="kx-sum-stages">
+                  {x.toStart > 0 && <i className="s0" style={{ flex: x.toStart }} />}
+                  {x.cooking > 0 && <i className="s1" style={{ flex: x.cooking }} />}
+                </div>
+                <div className="kx-sum-legend">
+                  {x.toStart > 0 && <><b>{x.toStart}</b> to start · </>}
+                  {x.cooking > 0 && <><b>{x.cooking}</b> {menu.stageOf(name).toLowerCase()} · </>}
+                  tokens {x.tokens.join(", ")}
+                </div>
+                {(x.mods.size > 0 || x.notes > 0 || x.parcel > 0) && (
+                  <div className="kx-mods">
+                    {x.parcel > 0 && <span className="kx-mod parcel">Parcel ×{x.parcel}</span>}
+                    {[...x.mods.entries()].map(([m, n]) => (
+                      <ModChip key={m} text={m} count={n} />
+                    ))}
+                    {x.notes > 0 && <span className="kx-mod soft">{x.notes} {x.notes > 1 ? "notes" : "note"}</span>}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         )}
-        {visibleBoard && (
-          <p style={{ marginTop: "0.6rem", fontSize: "0.8rem", color: "var(--muted)" }}>
-            Totals are <strong>ordered</strong> volume (not “still in kitchen”). Use per-line “Kitchen” counts below.
-            <br />
-            Window {visibleBoard.live_window_minutes}m · max {visibleBoard.max_rows} tickets
-          </p>
-        )}
       </section>
 
-      {!visibleBoard && !loadError && <p style={{ color: "var(--muted)" }}>Loading board…</p>}
-      {visibleBoard?.orders.length === 0 && (
-        <p style={{ color: "var(--muted)" }}>No tickets on the board.</p>
-      )}
-      <div className="kds-ticket-grid" style={ticketGrid}>
-        {visibleBoard?.orders.map((order) => {
-          let orderTypeText: string | undefined = order.order_type;
-          if (order.order_type === "DINEIN") orderTypeText = "Dine-in";
-          if (order.order_type === "TAKEAWAY") orderTypeText = "Takeaway";
-          
-          const isCompletelyReady = order.lines.length > 0 &&
-            order.lines.every((l) => getLineCounters(l).items_need_be_ready === 0) &&
-            order.lines.some((l) => getLineCounters(l).items_need_be_collected > 0);
+      <section className="kx-tickets-wrap" aria-labelledby="h-tickets">
+        <div className="kx-head">
+          <h2 id="h-tickets">
+            Tickets
+            {tickets.length > 0 && <span className="kx-sub">{tickets.length} on the board, oldest first</span>}
+          </h2>
+          <span className="kx-legend">
+            <i className="lg ok" />Under {WARN_MIN} min <i className="lg warn" />{WARN_MIN} to {LATE_MIN} min <i className="lg late" />Over {LATE_MIN} min
+          </span>
+        </div>
 
-          return (
-            <article key={order.id} style={ticket}>
-              <div style={ticketHead}>
-                <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", minWidth: 0, flexWrap: "wrap" }}>
-                  <span style={kot}>{order.kot_code}</span>
-                  {orderTypeText ? <span style={orderTypeBadge}>{orderTypeText}</span> : null}
-                  {isCompletelyReady ? (
-                    <button
-                      type="button"
-                      style={announceBtn}
-                      disabled={announcingOrderId === order.id}
-                      onClick={() => void handleAnnounceOrder(order.id)}
-                      title="Announce Order"
-                    >
-                      <MegaphoneIcon size={14} /> Announce
-                    </button>
-                  ) : null}
+        {!board && !error && <div className="kx-empty">Loading the board…</div>}
+        {board && tickets.length === 0 && (
+          <div className="kx-empty">No tickets at {where}. New orders appear here, oldest first.</div>
+        )}
+
+        <div className="kx-tickets">
+          {tickets.map((o) => {
+            const st = ticketState(o);
+            const created = new Date(o.created_at).getTime();
+            const mins = (now - created) / 60000;
+            const age = st === "ready" ? "done" : mins >= LATE_MIN ? "late" : mins >= WARN_MIN ? "warn" : "";
+            const parcelLines = o.lines.filter((l) => isParcel(o, l));
+            const allParcel = parcelLines.length === o.lines.length;
+            const mixed = parcelLines.length > 0 && !allParcel;
+            const ticketBusy = o.lines.some((l) => busy.has(l.id));
+            return (
+              <article key={o.id} className={`kx-ticket ${st === "ready" ? "is-ready" : ""} ${fresh.has(o.id) ? "fresh" : ""}`}>
+                <div className={`kx-t-head ${age}`}>
+                  <span className="kx-t-token">{tokenOf(o.kot_code)}</span>
+                  <div className="kx-t-meta">
+                    <span className="kx-t-age">{clock(now - created)}</span>
+                    <span className="kx-t-sub">{new Date(created).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                  </div>
+                  <div className="kx-t-badges">
+                    {allParcel && <span className="kx-mod parcel">Parcel</span>}
+                    {mixed && <span className="kx-mod parcel">Part parcel</span>}
+                    {st === "partial" && <span className="kx-pill partial">Partly ready</span>}
+                    {st === "ready" && <span className="kx-pill ready">Ready</span>}
+                  </div>
                 </div>
-                <span style={{ color: "var(--muted)", fontSize: "0.85rem", textAlign: "right" }}>
-                  {new Date(order.created_at).toLocaleString()}
-                </span>
-              </div>
-              <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                {order.lines.map((line) => {
-                  const c = getLineCounters(line);
-                  const visual = lineVisualPhase(c);
-                  const busy = lineBusy === line.id;
-                  const showAccept = line.order_status === "NOT_ACCEPTED";
-                  const showReady = c.items_need_be_ready > 0;
-                  const showCollect = c.items_need_be_collected > 0;
-                  const anyAction = showAccept || showReady || showCollect;
-                  const showBatchField =
-                    (showReady && c.items_need_be_ready > 1) ||
-                    (showCollect && c.items_need_be_collected > 1);
 
-                  return (
-                    <li key={line.id} style={lineRow(visual)}>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ ...lineItemText, fontWeight: 600 }}>{line.item_name}</div>
-                        <div style={{ fontSize: "0.85rem", color: "var(--muted)" }}>
-                          Ordered ×{line.quantity} · Kitchen {c.items_need_be_ready} · Counter{" "}
-                          {c.items_need_be_collected}
+                <div className="kx-t-items">
+                  {o.lines.map((l) => {
+                    const c = getLineCounters(l);
+                    const done = l.order_status === "COLLECTED";
+                    const lineBusy = busy.has(l.id);
+                    const toMake = c.items_need_be_ready;
+                    const atCounter = c.items_need_be_collected;
+                    const cap = toMake > 0 ? toMake : atCounter;
+                    const qty = Math.min(partQty[l.id] ?? cap, cap);
+                    const stage =
+                      done ? "Collected"
+                        : toMake === 0 ? "At the counter"
+                        : l.order_status === "NOT_ACCEPTED" ? "To start"
+                        : atCounter > 0 ? `${menu.stageOf(l.item_name)} · ${atCounter} at counter`
+                        : menu.stageOf(l.item_name);
+                    return (
+                      <div
+                        key={l.id}
+                        className={`kx-t-item ${done ? "done" : ""} ${toMake === 0 && !done ? "ready" : ""} ${inStation(menu, station, l.item_name) ? "" : "dim"}`}
+                      >
+                        <div className="kx-t-name">
+                          <span className="q">{l.quantity}×</span>
+                          {l.item_name}
                         </div>
-                        {showBatchField ? (() => {
-                          const maxQty = showReady ? c.items_need_be_ready : Math.max(c.items_need_be_collected, 1);
-                          const currentQtyStr = batchByLineId[line.id];
-                          const displayQty = currentQtyStr !== undefined ? currentQtyStr : maxQty;
-                          const numQty = displayQty === "" ? 1 : Number(displayQty);
-                          
-                          const handleDec = () => {
-                            if (busy || numQty <= 1) return;
-                            setBatchByLineId((m) => ({ ...m, [line.id]: String(numQty - 1) }));
-                          };
-                          
-                          const handleInc = () => {
-                            if (busy || numQty >= maxQty) return;
-                            setBatchByLineId((m) => ({ ...m, [line.id]: String(numQty + 1) }));
-                          };
-
-                          return (
-                            <div style={batchRow}>
-                              <span style={{ color: "var(--muted)", whiteSpace: "nowrap" }}>Batch qty</span>
-                              <div style={qtyWrapper}>
-                                <button
-                                  type="button"
-                                  disabled={busy || numQty <= 1}
-                                  onClick={handleDec}
-                                  style={{ ...qtyBtn, opacity: (busy || numQty <= 1) ? 0.5 : 1 }}
-                                >
-                                  -
-                                </button>
-                                <input
-                                  type="text"
-                                  inputMode="numeric"
-                                  value={displayQty}
-                                  disabled={busy}
-                                  onChange={(e) => {
-                                    const valStr = e.target.value.replace(/[^0-9]/g, '');
-                                    if (valStr === "") {
-                                      setBatchByLineId((m) => ({ ...m, [line.id]: "" }));
-                                    } else {
-                                      let val = parseInt(valStr, 10);
-                                      if (val > maxQty) val = maxQty;
-                                      setBatchByLineId((m) => ({ ...m, [line.id]: String(val) }));
-                                    }
-                                  }}
-                                  style={qtyInputCenter}
-                                  aria-label={`Batch quantity for ${line.item_name}`}
-                                />
-                                <button
-                                  type="button"
-                                  disabled={busy || numQty >= maxQty}
-                                  onClick={handleInc}
-                                  style={{ ...qtyBtn, opacity: (busy || numQty >= maxQty) ? 0.5 : 1 }}
-                                >
-                                  +
-                                </button>
-                              </div>
-                            </div>
-                          );
-                        })() : null}
-                      </div>
-                      <div style={actionCol}>
-                        {showAccept ? (
-                          <button
-                            type="button"
-                            style={advanceBtn}
-                            disabled={busy}
-                            onClick={() => void sendPatch(line, "PREPARING", 0, false)}
-                          >
-                            Start
-                          </button>
-                        ) : null}
-                        {showReady ? (
-                          <button
-                            type="button"
-                            style={advanceBtn}
-                            disabled={busy}
-                            onClick={() => void sendPatch(line, "READY", c.items_need_be_ready, showBatchField)}
-                          >
-                            Ready
-                          </button>
-                        ) : null}
-                        {showCollect ? (
-                          <div style={{ display: "flex", gap: "0.35rem" }}>
-                            <button
-                              type="button"
-                              style={{ ...advanceBtn, flex: 1, background: "var(--gold-primary)", color: "var(--text-on-dark)" }}
-                              disabled={busy}
-                              onClick={() =>
-                                void sendPatch(line, "COLLECTED", c.items_need_be_collected, showBatchField)
-                              }
-                            >
+                        <div className="kx-t-stage">
+                          <span className="st">{stage}</span>
+                          {cap > 1 && l.order_status !== "NOT_ACCEPTED" && (
+                            <span className="kx-part" aria-label={`How many ${l.item_name}`}>
+                              <button type="button" disabled={lineBusy || qty <= 1} onClick={() => setPartQty((m) => ({ ...m, [l.id]: qty - 1 }))}>−</button>
+                              <output>{qty}</output>
+                              <button type="button" disabled={lineBusy || qty >= cap} onClick={() => setPartQty((m) => ({ ...m, [l.id]: qty + 1 }))}>+</button>
+                            </span>
+                          )}
+                          {l.order_status === "NOT_ACCEPTED" ? (
+                            <button type="button" className="kx-bump" disabled={lineBusy} onClick={() => void move([{ lineId: l.id, status: "PREPARING" }])}>
+                              Start
+                            </button>
+                          ) : toMake > 0 ? (
+                            <button type="button" className="kx-bump go" disabled={lineBusy} onClick={() => void move([{ lineId: l.id, status: "READY", quantity: qty }])}>
+                              Ready
+                            </button>
+                          ) : atCounter > 0 ? (
+                            <button type="button" className="kx-bump" disabled={lineBusy} onClick={() => void move([{ lineId: l.id, status: "COLLECTED", quantity: qty }])}>
                               Collected
                             </button>
-                            <button
-                              type="button"
-                              style={{ ...announceBtn, padding: "0.35rem 0.5rem" }}
-                              disabled={announcingLineId === line.id}
-                              onClick={() => void handleAnnounceItem(line.id)}
-                              title="Announce Item"
-                            >
-                              <MegaphoneIcon size={14} />
-                            </button>
+                          ) : (
+                            <span className="kx-check" aria-label="Done">✓</span>
+                          )}
+                        </div>
+                        {((l.options?.length ?? 0) > 0 || l.note || (mixed && isParcel(o, l))) && (
+                          <div className="kx-t-detail">
+                            <div className="kx-mods">
+                              {mixed && isParcel(o, l) && <span className="kx-mod parcel">Parcel</span>}
+                              {(l.options ?? []).map((m) => (
+                                <ModChip key={m} text={m} />
+                              ))}
+                            </div>
+                            {l.note && <div className="kx-note">{l.note}</div>}
                           </div>
-                        ) : null}
-                        {!anyAction ? (
-                          <span style={{ color: "var(--ready)", fontSize: "0.85rem" }}>Done</span>
-                        ) : null}
+                        )}
                       </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            </article>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
+                    );
+                  })}
+                </div>
 
-const page: CSSProperties = { minHeight: "100vh", padding: "1rem 1.25rem", background: "var(--bg-cream)" };
-const topBar: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "flex-start",
-  gap: "1rem",
-  marginBottom: "1rem",
-  flexWrap: "wrap",
-};
-const linkMuted: CSSProperties = { color: "var(--text-secondary)" };
-const errBox: CSSProperties = {
-  background: "rgba(234, 67, 53, 0.12)",
-  border: "1px solid var(--warn)",
-  padding: "0.65rem 0.85rem",
-  borderRadius: 8,
-  marginBottom: "1rem",
-};
-const successBox: CSSProperties = {
-  background: "rgba(52, 168, 83, 0.12)",
-  border: "1px solid var(--success, #34a853)",
-  color: "var(--success-dark, #2e7d32)",
-  padding: "0.65rem 0.85rem",
-  borderRadius: 8,
-  marginBottom: "1rem",
-  fontWeight: 600,
-};
-const clubbedStrip: CSSProperties = {
-  background: "var(--neutral-50)",
-  border: "1px solid var(--border-primary)",
-  borderRadius: 12,
-  padding: "1rem",
-  marginBottom: "1rem",
-  boxShadow: "var(--shadow-sm)",
-};
-const clubbedChipWrap: CSSProperties = {
-  display: "flex",
-  flexWrap: "wrap",
-  gap: "0.55rem",
-  marginTop: "0.65rem",
-  overflowX: "visible",
-};
-const clubbedChip: CSSProperties = {
-  display: "inline-flex",
-  alignItems: "center",
-  gap: "0.45rem",
-  border: "1px solid var(--border-primary)",
-  borderRadius: 999,
-  padding: "0.35rem 0.7rem",
-  background: "var(--bg-warm)",
-  whiteSpace: "nowrap",
-};
-const clubbedQty: CSSProperties = {
-  minWidth: 24,
-  height: 24,
-  borderRadius: 999,
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  background: "var(--secondary-gradient)",
-  color: "var(--text-on-dark)",
-  fontWeight: 700,
-  fontSize: "0.78rem",
-};
-const clubbedName: CSSProperties = {
-  color: "var(--text-primary)",
-  fontWeight: 600,
-};
-const ticketGrid: CSSProperties = {
-  gap: "1rem",
-};
-const ticket: CSSProperties = {
-  background: "var(--neutral-50)",
-  border: "1px solid var(--border-primary)",
-  borderRadius: 12,
-  padding: "0.85rem 1rem",
-  minWidth: 0,
-};
-const ticketHead: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "baseline",
-  marginBottom: "0.65rem",
-  gap: "0.5rem",
-};
-const kot: CSSProperties = { fontSize: "1.25rem", fontWeight: 700, color: "var(--gold-accent)" };
-const orderTypeBadge: CSSProperties = {
-  fontSize: "0.72rem",
-  fontWeight: 700,
-  textTransform: "uppercase",
-  letterSpacing: "0.02em",
-  borderRadius: 999,
-  padding: "0.15rem 0.5rem",
-  background: "var(--order-type-gradient)",
-  color: "var(--text-on-dark)",
-  whiteSpace: "nowrap",
-};
-const lineBase: CSSProperties = {
-  display: "flex",
-  justifyContent: "space-between",
-  alignItems: "stretch",
-  gap: "0.75rem",
-  padding: "0.5rem 0",
-  borderTop: "1px solid var(--neutral-300)",
-};
+                <div className="kx-t-foot">
+                  {st !== "ready" ? (
+                    <button type="button" className="kx-ghost go" disabled={ticketBusy} onClick={() => allReady(o)}>
+                      All ready
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="kx-ghost"
+                        onClick={async () => {
+                          if (await announceOrder(o.id)) setToast(`Token ${tokenOf(o.kot_code)} announced`);
+                        }}
+                      >
+                        Announce again
+                      </button>
+                      <button type="button" className="kx-ghost go" disabled={ticketBusy} onClick={() => allCollected(o)}>
+                        Collected
+                      </button>
+                    </>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
 
-const lineItemText: CSSProperties = {
-  wordBreak: "break-word",
-  overflowWrap: "anywhere",
-};
-
-const batchRow: CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  gap: "0.45rem",
-  marginTop: "0.35rem",
-  fontSize: "0.78rem",
-};
-
-const qtyWrapper: CSSProperties = {
-  display: "flex",
-  alignItems: "center",
-  border: "1px solid var(--border-primary)",
-  borderRadius: 6,
-  background: "var(--neutral-50)",
-  overflow: "hidden",
-};
-
-const qtyBtn: CSSProperties = {
-  background: "var(--bg-warm)",
-  border: "none",
-  color: "var(--text-primary)",
-  padding: "0.15rem 0.6rem",
-  fontSize: "1.1rem",
-  fontWeight: "bold",
-  cursor: "pointer",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-};
-
-const qtyInputCenter: CSSProperties = {
-  width: "2.5rem",
-  textAlign: "center",
-  border: "none",
-  borderLeft: "1px solid var(--border-primary)",
-  borderRight: "1px solid var(--border-primary)",
-  background: "transparent",
-  color: "var(--text-primary)",
-  padding: "0.2rem 0",
-  fontSize: "0.9rem",
-};
-
-const actionCol: CSSProperties = {
-  display: "flex",
-  flexDirection: "column",
-  gap: "0.35rem",
-  justifyContent: "center",
-  alignItems: "stretch",
-};
-
-function lineRow(status: "PREPARING" | "READY" | "COLLECTED"): CSSProperties {
-  if (status === "COLLECTED") {
-    return {
-      ...lineBase,
-      background: "linear-gradient(90deg, rgba(127, 147, 131, 0.18) 0%, rgba(127, 147, 131, 0) 80%)",
-      borderLeft: "3px solid var(--earth-light)",
-      paddingLeft: "0.5rem",
-      opacity: 0.85,
-    };
-  }
-  if (status === "READY") {
-    return {
-      ...lineBase,
-      background: "linear-gradient(90deg, rgba(61, 122, 79, 0.18) 0%, rgba(61, 122, 79, 0) 80%)",
-      borderLeft: "3px solid var(--gold-primary)",
-      paddingLeft: "0.5rem",
-    };
-  }
-  return {
-    ...lineBase,
-    background: "linear-gradient(90deg, rgba(247, 180, 37, 0.18) 0%, rgba(247, 180, 37, 0) 80%)",
-    borderLeft: "3px solid var(--gold-accent-light)",
-    paddingLeft: "0.5rem",
-  };
-}
-const advanceBtn: CSSProperties = {
-  padding: "0.35rem 0.65rem",
-  borderRadius: 8,
-  border: "1px solid var(--border-primary)",
-  background: "var(--secondary-gradient)",
-  color: "var(--text-on-dark)",
-  fontWeight: 600,
-  whiteSpace: "nowrap",
-};
-const announceBtn: CSSProperties = {
-  padding: "0.2rem 0.5rem",
-  borderRadius: 6,
-  border: "1px solid var(--border-primary)",
-  background: "var(--bg-cream)",
-  color: "var(--text-primary)",
-  cursor: "pointer",
-  display: "inline-flex",
-  alignItems: "center",
-  justifyContent: "center",
-  gap: "0.35rem",
-  fontSize: "0.9rem",
-};
-
-function MegaphoneIcon({ size = 16 }: { size?: number }) {
-  return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="m3 11 18-5v12L3 14v-3z" />
-      <path d="M11.6 16.8a3 3 0 1 1-5.8-1.6" />
-    </svg>
+      {toast && <div className="kx-toast" role="status">{toast}</div>}
+    </KdsShell>
   );
 }

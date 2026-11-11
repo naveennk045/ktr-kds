@@ -24,6 +24,12 @@ export interface KdsLine {
   /** Units at counter, not yet COLLECTED (new API). */
   items_need_be_collected?: number;
   order_status: OrderItemStatus;
+  /** Per-line DINEIN / TAKEAWAY (mixed orders); falls back to the order's type. */
+  order_type?: OrderType | string;
+  /** Free kitchen options chosen on the kiosk, e.g. "Extra crispy". */
+  options?: string[];
+  /** Guest's note for the kitchen. */
+  note?: string | null;
 }
 
 export interface KdsOrder {

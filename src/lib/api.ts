@@ -92,3 +92,14 @@ export function kdsWebSocketUrl(storeId: number, maxRows = 20): string {
   const url = new URL(path, `${wsBase}/`);
   return url.toString();
 }
+
+export interface MenuMetaPayload {
+  categories?: { id: string; name: string; stage?: string }[];
+  items?: { id: string; category: string; name: string; aliases?: string[] }[];
+}
+
+/** Hard-coded menu copy shared with the token board; used here to sort dishes into stations. */
+export async function fetchMenuMeta(): Promise<MenuMetaPayload> {
+  const res = await fetch(buildUrl("/tms/menu-meta"));
+  return parseJson<MenuMetaPayload>(res);
+}
