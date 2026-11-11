@@ -111,6 +111,9 @@ export default function Setup() {
             <Link to="/kds" style={primaryLink}>
               Open KDS
             </Link>
+            <Link to="/bar" style={primaryLink}>
+              Open coffee bar
+            </Link>
             <Link to="/tms" style={primaryLink}>
               Open TMS
             </Link>
